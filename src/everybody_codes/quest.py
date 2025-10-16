@@ -24,8 +24,8 @@ class Quest(AbstractContextManager):
         self.quest = quest
 
         # Set up cache directory
-        self.cache_dir = Path(cache_dir or Path.home() / ".everybody-codes")
-        self.cache_dir.mkdir(exist_ok=True)
+        cache_path = Path(cache_dir or Path.home() / ".everybody-codes")
+        cache_path.mkdir(exist_ok=True)
 
         # Set up session and get user info
         self.session = requests.Session()
@@ -33,42 +33,91 @@ class Quest(AbstractContextManager):
             "everybody-codes",
             session_cookie
             or os.getenv("EC_SESSION")
-            or (self.cache_dir / "session.txt").read_text().rstrip(),
+            or (cache_path / "session.txt").read_text().rstrip(),
         )
         self.session.headers["user-agent"] = (
             "github.com/tobeannouncd/everybody-codes-api"
         )
         user_info = self.session.get("https://everybody.codes/api/user/me").json()
-        self.user_dir = self.cache_dir / f"user_{user_info['id']}"
+        self.cache_dir = (
+            cache_path / f"user_{user_info['id']}" / f"{event_story}_{quest:02}"
+        )
+        self.cache_dir.mkdir(exist_ok=True)
+        self.notes_path = self.cache_dir / "notes.json"
+        self.keys_path = self.cache_dir / "keys.json"
         self.seed: int = user_info["seed"]
 
     def __getitem__(self, part: int) -> str:
-        encrypted = bytes.fromhex(self._encrypted_notes[str(part)])
-        key_bytes = self._keys()[f"key{part}"].encode()
+        if self.notes_path.exists():
+            with open(self.notes_path) as f:
+                notes = json.load(f)
+        else:
+            notes = {"clear": {}, "crypt": self._get_notes()}
+        k = str(part)
+        if k in notes["clear"]:
+            return notes["clear"][k]
+        encrypted = bytes.fromhex(notes["crypt"][k])
+        key_bytes = self._get_key(part)
         cipher = AES.new(key_bytes, AES.MODE_CBC, iv=key_bytes[:16])
-        return unpad(cipher.decrypt(encrypted), AES.block_size).decode()
+        clear = unpad(cipher.decrypt(encrypted), AES.block_size).decode()
+        notes["clear"][k] = clear
+        with open(self.notes_path, "w") as f:
+            json.dump(notes, f)
+        return clear
+
+    def _get_notes(self) -> dict[str, str]:
+        url = f"https://everybody-codes.b-cdn.net/assets/{self.event_story}/{self.quest}/input/{self.seed}.json"
+        response = self.session.get(url)
+        response.raise_for_status()
+        return response.json()
+
+    def _get_key(self, part: int) -> bytes:
+        key = None
+        k = f"key{part}"
+        if self.keys_path.exists():
+            key = json.loads(self.keys_path.read_text()).get(k)
+        if key is None:
+            key = self._update_keys().get(k)
+        if isinstance(key, str):
+            return key.encode()
+        raise ValueError(f"Invalid part: {part}")
+
+    def _update_keys(self) -> dict[str, str]:
+        url = f"https://everybody.codes/api/event/{self.event_story}/quest/{self.quest}"
+        response = self.session.get(url)
+        response.raise_for_status()
+        self.keys_path.write_bytes(response.content)
+        return response.json()
 
     def __iter__(self) -> Iterator[str]:
         yield self[1]
         yield self[2]
         yield self[3]
 
-    def submit(self, part: int, answer: Any, display: bool = False) -> None:
-        if display:
-            print(f"Submitting {repr(answer)} for part {part}...", file=sys.stderr)
-        keys = self._keys()
-        if f"answer{part}" in keys:
-            prev_answer = keys[f"answer{part}"]
+    def submit(self, part: int, answer: Any) -> None:
+        # Hack to ensure that integer answers are submitted properly
+        if isinstance(answer, float) and answer.is_integer():
+            answer = int(answer)
+
+        keys = {}
+        if self.keys_path.exists():
+            keys.update(json.loads(self.keys_path.read_text()))
+        k = f"answer{part}"
+        if k not in keys:
+            keys = self._update_keys()
+        if k in keys:
+            prev_answer = keys[k]
             if str(prev_answer) == str(answer):
-                print(
-                    "This answer was already submitted and is correct.", file=sys.stderr
-                )
+                print("Correct answer!", file=sys.stderr)
             else:
                 print(
-                    f"This answer ({answer}) does not match the previous answer ({prev_answer}).",
+                    "Incorrect answer.\n"
+                    f"Expected: {prev_answer}\n"
+                    f" But got: {answer}",
                     file=sys.stderr,
                 )
             return
+        print(f"Submitting {repr(answer)} for part {part}...", file=sys.stderr)
         url = f"https://everybody.codes/api/event/{self.event_story}/quest/{self.quest}/part/{part}/answer"
         response = self.session.post(url, json={"answer": answer})
         response.raise_for_status()
@@ -82,27 +131,6 @@ class Quest(AbstractContextManager):
                 f"The first character is {'' if feedback['firstCorrect'] else 'in'}correct",
                 file=sys.stderr,
             )
-
-    @cached_property
-    def _encrypted_notes(self) -> dict[str, str]:
-        notes_path = self.user_dir / f"{self.event_story}-{self.quest:02}_notes.json"
-        if notes_path.exists():
-            with open(notes_path) as f:
-                notes = json.load(f)
-        else:
-            url = f"https://everybody-codes.b-cdn.net/assets/{self.event_story}/{self.quest}/input/{self.seed}.json"
-            response = self.session.get(url)
-            response.raise_for_status()
-            notes_path.write_bytes(response.content)
-            notes = response.json()
-        return notes
-
-    def _keys(self) -> dict[str, str]:
-        """We don't cache this because the endpoint is not static."""
-        url = f"https://everybody.codes/api/event/{self.event_story}/quest/{self.quest}"
-        response = self.session.get(url)
-        response.raise_for_status()
-        return response.json()
 
     def __enter__(self) -> "Quest":
         return self
